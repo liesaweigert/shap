@@ -8,6 +8,37 @@ torch = None
 class PyTorchDeepExplainer(Explainer):
 
     def __init__(self, model, data):
+        """ An explainer object for a deep model using a given background dataset.
+
+        Note that the complexity of the method scales linearly with the number of background data
+        samples. Passing the entire training dataset as `data` will give very accurate expected
+        values, but be unreasonably expensive. The variance of the expectation estimates scale by
+        roughly 1/sqrt(N) for N background data samples. So 100 samples will give a good estimate,
+        and 1000 samples a very good estimate of the expected values.
+
+        Parameters
+        ----------
+        model : nn.Module object or a tuple (model, layer), where both are nn.Module objects
+            The model is an nn.Module object which takes a tensor (or a list of tensors) in the
+            shape of the input (usually 4xsequence_length) as input, and returns a single
+            dimensional output.
+            If the input is a tuple, the returned shap values will be for the input of the
+            layer argument. Layer must be a layer in the given model, e.g. model.conv2
+        data : [torch.tensor] or function
+            The background dataset to use for integrating out features. DeepExplainer integrates
+            over all these samples for each explanation. The data passed here must match the input
+            tensors given to the model. Note that since these samples are integrated over for each
+            sample you should only choose about 100-1000 background samples.
+            If a function is supplied, it must be a function that takes a particular input example
+            and generates the background dataset for that example
+        """
+
+        # warnings.warn(
+        #     "Please keep in mind DeepExplainer is brand new, and we are still developing it and working on " +
+        #     "characterizing/testing it on large networks. This means you should keep an eye out for odd " +
+        #     "behavior. Post any issues you run into on github."
+        # )
+
         # try and import pytorch
         global torch
         if torch is None:
@@ -19,7 +50,7 @@ class PyTorchDeepExplainer(Explainer):
         self.multi_input = False
         if type(data) == list:
             self.multi_input = True
-        if type(data) != list:
+        if type(data) != list and hasattr(data, '__call__') == False:
             data = [data]
         self.data = data
         self.layer = None
@@ -51,15 +82,18 @@ class PyTorchDeepExplainer(Explainer):
         self.multi_output = False
         self.num_outputs = 1
         with torch.no_grad():
-            outputs = model(*data)
+            if(hasattr(data, '__call__')):
+                self.expected_value = None
+            else:
+                outputs = model(*data)
 
-            # also get the device everything is running on
-            self.device = outputs.device
+                # also get the device everything is running on
+                self.device = outputs.device
 
-            if outputs.shape[1] > 1:
-                self.multi_output = True
-                self.num_outputs = outputs.shape[1]
-            self.expected_value = outputs.mean(0).cpu().numpy()
+                if outputs.shape[1] > 1:
+                    self.multi_output = True
+                    self.num_outputs = outputs.shape[1]
+                self.expected_value = outputs.mean(0).cpu().numpy()
 
     def add_target_handle(self, layer):
         input_handle = layer.register_forward_hook(get_target_input)
@@ -158,11 +192,19 @@ class PyTorchDeepExplainer(Explainer):
                 for k in range(len(X)):
                     phis.append(np.zeros(X[k].shape))
             for j in range(X[0].shape[0]):
+                #Integration of function as data input
+                if(hasattr(data, '__callable__')):
+                    bg_data = self.data(X[l][j] for j in range(len(X)))
+                    if type(bg_data) != list:
+                        bg_data = [bg_data]
+                else:
+                    bg_data = self.data
+
                 # tile the inputs to line up with the background data samples
                 tiled_X = [X[l][j:j + 1].repeat(
-                                   (self.data[l].shape[0],) + tuple([1 for k in range(len(X[l].shape) - 1)])) for l
+                                   (bg_data[l].shape[0],) + tuple([1 for k in range(len(X[l].shape) - 1)])) for l
                            in range(len(X))]
-                joint_x = [torch.cat((tiled_X[l], self.data[l]), dim=0) for l in range(len(X))]
+                joint_x = [torch.cat((tiled_X[l], bg_data[l]), dim=0) for l in range(len(X))]
                 # run attribution computation graph
                 feature_ind = model_output_ranks[j, i]
                 sample_phis = self.gradient(feature_ind, joint_x)
@@ -175,10 +217,10 @@ class PyTorchDeepExplainer(Explainer):
                         x.append(x_temp)
                         data.append(data_temp)
                     for l in range(len(self.interim_inputs_shape)):
-                        phis[l][j] = (sample_phis[l][self.data[l].shape[0]:] * (x[l] - data[l])).mean(0)
+                        phis[l][j] = (sample_phis[l][bg_data[l].shape[0]:] * (x[l] - data[l])).mean(0)
                 else:
                     for l in range(len(X)):
-                        phis[l][j] = (torch.from_numpy(sample_phis[l][self.data[l].shape[0]:]).to(self.device) * (X[l][j: j + 1] - self.data[l])).cpu().numpy().mean(0)
+                        phis[l][j] = (torch.from_numpy(sample_phis[l][bg_data[l].shape[0]:]).to(self.device) * (X[l][j: j + 1] - bg_data[l])).cpu().numpy().mean(0)
             output_phis.append(phis[0] if not self.multi_input else phis)
         # cleanup; remove all gradient handles
         for handle in handles:
@@ -195,8 +237,6 @@ class PyTorchDeepExplainer(Explainer):
             return output_phis
 
 # Module hooks
-
-
 def deeplift_grad(module, grad_input, grad_output):
     """The backward hook which computes the deeplift
     gradient for an nn.Module
